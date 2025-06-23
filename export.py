@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 import pyarrow as pa
 import pyarrow.parquet as pq
+from dedup import dedup_df
 
 load_dotenv()
 
@@ -303,6 +304,36 @@ def main(output_dir):
         "successful_submissions_part_*.parquet",
         os.path.join(output_dir, "successful_submissions.parquet")
     )
+
+    # Apply deduplication to submissions
+    print("Applying deduplication to submissions...")
+    submissions_parquet_path = os.path.join(output_dir, "submissions.parquet")
+    try:
+        submissions_df = pd.read_parquet(submissions_parquet_path)
+        original_count = len(submissions_df)
+
+        deduplicated_submissions_df = dedup_df(submissions_df.copy())
+        deduplicated_submissions_path = os.path.join(output_dir, "deduplicated_submissions.parquet")
+        deduplicated_submissions_df.to_parquet(deduplicated_submissions_path, index=False)
+
+        print(f"Deduplicated submissions saved to {deduplicated_submissions_path}")
+        print(f"Original submissions: {original_count}, After deduplication: {len(deduplicated_submissions_df)}")
+
+        # Create deduplicated successful submissions
+        if 'run_passed' in deduplicated_submissions_df.columns:
+            print("Creating deduplicated successful submissions...")
+            deduplicated_successful_df = deduplicated_submissions_df[deduplicated_submissions_df['run_passed'] == True].copy()
+            deduplicated_successful_path = os.path.join(output_dir, "deduplicated_successful_submissions.parquet")
+            deduplicated_successful_df.to_parquet(deduplicated_successful_path, index=False)
+
+            successful_parquet_path = os.path.join(output_dir, "successful_submissions.parquet")
+            successful_df = pd.read_parquet(successful_parquet_path)
+            print(f"Deduplicated successful submissions saved to {deduplicated_successful_path}")
+            print(f"Original successful: {len(successful_df)}, After deduplication: {len(deduplicated_successful_df)}")
+
+    except Exception as e:
+        print(f"Warning: Deduplication failed with error: {e}")
+        print("Proceeding without deduplication...")
 
 
 if __name__ == "__main__":
