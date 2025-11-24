@@ -1,10 +1,11 @@
 import argparse
+import gc
 import os
-import numpy as np
 import pandas as pd
-from datasets import Dataset
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 load_dotenv()
 
@@ -24,32 +25,32 @@ DB_NAME = os.environ.get("DB_NAME", "postgres")
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # The leaderboard IDs to export
-LEADERBOARD_IDS = [463, 430, 399, 398]
+LEADERBOARD_IDS = [463, 430, 399, 398, 563, 564, 565]
 
 
-def fetch_leaderboards(engine, leaderboard_ids) -> Dataset:
+def fetch_and_save_leaderboards(engine, leaderboard_ids, output_path):
     """
-    Fetches and processes leaderboard data from the database.
+    Fetches leaderboard data from the database and saves it directly to parquet.
 
     This function queries the database for specific leaderboards, selecting
     key fields and fetching all associated GPU types for each leaderboard
-    using a subquery.
+    using a subquery. It saves the leaderboards directly to parquet.
 
     Args:
         engine: The SQLAlchemy engine instance for database connection.
         leaderboard_ids: A list of integer IDs for the leaderboards to fetch.
 
     Returns:
-        A Hugging Face `Dataset` object containing the leaderboard data.
+        The number of leaderboards.
     """
-    print("Fetching leaderboards...")
+    print("Fetching and saving leaderboards...")
     query = text("""
         SELECT
             id,
             name,
-            deadline,
+            deadline AT TIME ZONE 'UTC' AS deadline,
             task->>'lang' AS lang,
-            task->>'description' AS description,
+            description,
             task->'files'->>'reference.py' AS reference,
             (
                 SELECT array_agg(gpu_type)
@@ -60,10 +61,45 @@ def fetch_leaderboards(engine, leaderboard_ids) -> Dataset:
         WHERE id = ANY(:leaderboard_ids)
     """)
     df = pd.read_sql_query(query, engine, params={'leaderboard_ids': leaderboard_ids})
-    return Dataset.from_pandas(df)
+    df.to_parquet(output_path, index=False)
+    print(f"Leaderboards saved to {output_path}")
 
 
-def fetch_submissions(engine, leaderboard_ids) -> Dataset:
+def anonymize_users_in_db(engine, leaderboard_ids):
+    """Create a temporary mapping table in the database."""
+    with engine.begin() as conn:
+        # Create temporary table with anonymized IDs
+        conn.execute(text("""
+            CREATE TEMP TABLE user_mapping AS
+            SELECT
+                user_id as original_user_id,
+                ROW_NUMBER() OVER (ORDER BY RANDOM()) as anonymized_user_id
+            FROM (
+                SELECT DISTINCT user_id
+                FROM leaderboard.submission
+                WHERE leaderboard_id = ANY(:leaderboard_ids)
+            ) AS distinct_users
+        """), {'leaderboard_ids': leaderboard_ids})
+
+
+def handle_empty_structs(df):
+    """
+    Replace empty struct/dict values with None to avoid PyArrow serialization errors.
+
+    PyArrow cannot write empty struct types to Parquet. This function checks
+    columns that contain dict/struct values and replaces empty ones with None.
+    """
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            # Check if column contains dict-like objects
+            sample = df[col].dropna().head(1)
+            if len(sample) > 0 and isinstance(sample.iloc[0], dict):
+                # Replace empty dicts with None
+                df[col] = df[col].apply(lambda x: None if isinstance(x, dict) and len(x) == 0 else x)
+    return df
+
+
+def fetch_and_save_submissions(engine, leaderboard_ids, output_path, chunksize=8192):
     """
     Fetches and processes submission data from the database.
 
@@ -76,23 +112,20 @@ def fetch_submissions(engine, leaderboard_ids) -> Dataset:
         engine: The SQLAlchemy engine instance for database connection.
         leaderboard_ids: A list of integer IDs for the leaderboards whose
             submissions are to be fetched.
-
-    Returns:
-        A Hugging Face `Dataset` object containing the submissions data.
     """
     print("Fetching submissions...")
-    query = text("""
+    query = """
         SELECT
             s.id AS submission_id,
             s.leaderboard_id,
-            s.user_id,
-            s.submission_time,
+            um.anonymized_user_id AS user_id,
+            s.submission_time AT TIME ZONE 'UTC' AS submission_time,
             s.file_name,
             c.code,
             c.id AS code_id,
             r.id AS run_id,
-            r.start_time AS run_start_time,
-            r.end_time AS run_end_time,
+            r.start_time AT TIME ZONE 'UTC' AS run_start_time,
+            r.end_time AT TIME ZONE 'UTC' AS run_end_time,
             r.mode AS run_mode,
             r.score AS run_score,
             r.passed AS run_passed,
@@ -101,12 +134,61 @@ def fetch_submissions(engine, leaderboard_ids) -> Dataset:
             r.meta as run_meta,
             r.system_info AS run_system_info
         FROM leaderboard.submission AS s
-        JOIN leaderboard.runs AS r ON s.id = r.submission_id
+        LEFT JOIN leaderboard.runs AS r ON s.id = r.submission_id
         JOIN leaderboard.code_files AS c ON s.code_id = c.id
+        LEFT JOIN user_mapping um ON s.user_id = um.original_user_id
         WHERE s.leaderboard_id = ANY(:leaderboard_ids)
-    """)
-    df = pd.read_sql_query(query, engine, params={'leaderboard_ids': leaderboard_ids})
-    return Dataset.from_pandas(df)
+    """
+
+    part = 0
+
+    with engine.connect().execution_options(stream_results=True) as conn:
+        for chunk_df in pd.read_sql_query(
+            text(query),
+            conn,
+            params={'leaderboard_ids': leaderboard_ids},
+            chunksize=chunksize
+        ):
+            # Decode hex values code column
+            if 'code' in chunk_df.columns:
+                chunk_df['code'] = chunk_df['code'].apply(decode_hex_if_needed)
+
+            # Convert nullable integer columns to consistent types
+            # This prevents type mismatches when some chunks have all NULLs
+            nullable_int_cols = ['run_id', 'code_id', 'submission_id', 'leaderboard_id', 'user_id']
+            for col in nullable_int_cols:
+                if col in chunk_df.columns:
+                    chunk_df[col] = chunk_df[col].astype('Int64')
+
+            # Handle empty structs that PyArrow can't serialize
+            chunk_df = handle_empty_structs(chunk_df)
+
+            # Convert to arrow table
+            table = pa.Table.from_pandas(chunk_df)
+
+            # Write chunk as separate parquet file
+            filename = os.path.join(output_path, f"submissions_part_{part:05d}.parquet")
+            pq.write_table(table, filename)
+
+            print(f"  Wrote {len(chunk_df)} submissions to part {part}")
+
+            # Filter for and save successful submissions
+            if 'run_passed' in chunk_df.columns:
+                success_mask = chunk_df['run_passed'] == True
+                if success_mask.any():
+                    success_df = chunk_df[success_mask]
+                    success_table = pa.Table.from_pandas(success_df)
+                    success_filename = os.path.join(output_path, f"successful_submissions_part_{part:05d}.parquet")
+                    pq.write_table(success_table, success_filename)
+                    print(f"  Wrote {len(success_df)} successful submissions to part {part}")
+                    del success_df, success_table, success_mask
+
+            del chunk_df, table
+            gc.collect()
+
+            part += 1
+
+    print(f"Submissions saved to {part} parquet files in {output_path}")
 
 
 def decode_hex_if_needed(code_val: str) -> str:
@@ -132,6 +214,53 @@ def decode_hex_if_needed(code_val: str) -> str:
     return code_val
 
 
+def consolidate_parquet_files(input_dir, pattern, output_file):
+    """
+    Consolidates multiple parquet part files into a single parquet file.
+
+    Args:
+        input_dir: Directory containing the parquet part files
+        pattern: Glob pattern to match the part files (e.g., "submissions_part_*.parquet")
+        output_file: Path to the output consolidated parquet file
+    """
+    import glob
+
+    # Find all matching parquet files
+    part_files = sorted(glob.glob(os.path.join(input_dir, pattern)))
+
+    if not part_files:
+        print(f"  No files found matching pattern {pattern}")
+        return
+
+    print(f"  Consolidating {len(part_files)} {pattern} files into {output_file}...")
+
+    # First pass: Read only schemas (not data) from all files to unify them
+    schemas = []
+    for part_file in part_files:
+        parquet_file = pq.ParquetFile(part_file)
+        schemas.append(parquet_file.schema_arrow)
+
+    # Unify schemas across all tables to handle struct field variations
+    unified_schema = pa.unify_schemas(schemas)
+
+    # Second pass: Read each file, cast to unified schema, and write incrementally
+    total_rows = 0
+    with pq.ParquetWriter(output_file, unified_schema) as writer:
+        for part_file in part_files:
+            # Read one file at a time
+            table = pq.read_table(part_file)
+
+            # Cast to unified schema (fills missing fields with nulls)
+            unified_table = table.cast(unified_schema)
+
+            # Write to output file
+            writer.write_table(unified_table)
+
+            total_rows += len(unified_table)
+
+    print(f"  Done! Consolidated {len(part_files)} files ({total_rows} total rows)")
+
+
 def main(output_dir):
     """
     Orchestrates the data export process.
@@ -140,80 +269,40 @@ def main(output_dir):
     and submission data, anonymizes user IDs, and saves the results to
     separate Parquet files: `leaderboards.parquet`, `submissions.parquet`,
     and `successful_submissions.parquet`. The user ID mapping is not saved.
+    Temporary files are not deleted and should be manually removed if
+    desired.
 
     Args:
         output_dir (str): The local directory path to save the Parquet files.
     """
     engine = create_engine(DATABASE_URL)
-    rng = np.random.default_rng()
 
     # Ensure the output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
     # Fetch and save leaderboards
-    leaderboards_dataset = fetch_leaderboards(engine, LEADERBOARD_IDS)
     leaderboards_output_path = os.path.join(output_dir, "leaderboards.parquet")
-    leaderboards_dataset.to_parquet(leaderboards_output_path)
-    print(f"Leaderboards dataset successfully saved to {leaderboards_output_path}")
+    fetch_and_save_leaderboards(engine, LEADERBOARD_IDS, leaderboards_output_path)
+
+    anonymize_users_in_db(engine, LEADERBOARD_IDS)
 
     # Fetch submissions
-    submissions_dataset = fetch_submissions(engine, LEADERBOARD_IDS)
-    submissions_df = submissions_dataset.to_pandas()
+    submissions_output_path = os.path.join(output_dir, "submissions")
+    os.makedirs(submissions_output_path, exist_ok=True)
+    fetch_and_save_submissions(engine, LEADERBOARD_IDS, submissions_output_path)
 
-    # Decode hexadecimal 'code' values
-    if 'code' in submissions_df.columns:
-        print("Decoding 'code' column from hexadecimal where necessary...")
-        submissions_df['code'] = submissions_df['code'].apply(decode_hex_if_needed)
+    # Consolidate part files into single parquet files
+    consolidate_parquet_files(
+        submissions_output_path,
+        "submissions_part_*.parquet",
+        os.path.join(output_dir, "submissions.parquet")
+    )
 
-    # Anonymize user IDs if submissions exist
-    if not submissions_df.empty and 'user_id' in submissions_df.columns:
-        print("Anonymizing user IDs...")
-        unique_user_ids = submissions_df['user_id'].unique()
-        num_unique_users = len(unique_user_ids)
-
-        # Create a randomly permuted mapping in memory
-        permuted_ids = rng.permutation(range(1, num_unique_users + 1))
-        user_map_df = pd.DataFrame({
-            'original_user_id': unique_user_ids,
-            'anonymized_user_id': permuted_ids
-        })
-
-        # Replace original user IDs with anonymized IDs
-        original_cols = list(submissions_df.columns)
-        user_id_index = original_cols.index('user_id')
-        
-        submissions_df = submissions_df.merge(user_map_df, left_on='user_id', right_on='original_user_id')
-        submissions_df = submissions_df.drop(columns=['user_id', 'original_user_id'])
-        submissions_df = submissions_df.rename(columns={'anonymized_user_id': 'user_id'})
-
-        # Restore original column order
-        new_order = [col for col in original_cols if col != 'user_id']
-        new_order.insert(user_id_index, 'user_id')
-        submissions_df = submissions_df[new_order]
-
-        # Convert back to a dataset
-        submissions_dataset = Dataset.from_pandas(submissions_df)
-
-    # Save the submissions dataset (anonymized or original if empty)
-    submissions_output_path = os.path.join(output_dir, "submissions.parquet")
-    submissions_dataset.to_parquet(submissions_output_path)
-    print(f"Submissions dataset successfully saved to {submissions_output_path}")
-
-    # Filter for and save successful submissions from the anonymized data
-    if 'run_passed' in submissions_df.columns:
-        print("Creating successful submissions dataset...")
-        successful_submissions_df = submissions_df[submissions_df['run_passed'] == True].copy()
-
-        # Convert to dataset and save
-        successful_submissions_dataset = Dataset.from_pandas(successful_submissions_df)
-        successful_output_path = os.path.join(
-            output_dir, "successful_submissions.parquet"
-        )
-        successful_submissions_dataset.to_parquet(successful_output_path)
-        print(
-            "Successful submissions dataset successfully saved to "
-            f"{successful_output_path}"
-        )
+    consolidate_parquet_files(
+        submissions_output_path,
+        "successful_submissions_part_*.parquet",
+        os.path.join(output_dir, "successful_submissions.parquet")
+    )
 
 
 if __name__ == "__main__":
