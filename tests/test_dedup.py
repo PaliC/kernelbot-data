@@ -14,20 +14,16 @@ import tempfile
 import os
 import sys
 
-# Import the functions we want to test
-try:
-    from dedup import (
-        remove_duplicates,
-        fuzzy_filter,
-        convert_df_to_dict,
-        flatten_data,
-        dedup_df,
-        count_items,
-        create_parquet_file
-    )
-except ImportError as e:
-    print(f"Import error: {e}")
-    print("Some functions may not be available for testing")
+
+from dedup import (
+    remove_duplicates,
+    fuzzy_filter,
+    convert_df_to_dict,
+    flatten_data,
+    dedup_df,
+    _count_items,
+    create_parquet_file
+)
 
 
 class TestDedupEndToEnd(unittest.TestCase):
@@ -193,10 +189,10 @@ class TestDedupEndToEnd(unittest.TestCase):
         """Test exact duplicate removal."""
         try:
             data_dict = convert_df_to_dict(self.df)
-            original_count = count_items(data_dict)
+            original_count = _count_items(data_dict)
             
             deduplicated_data = remove_duplicates(data_dict)
-            deduplicated_count = count_items(deduplicated_data)
+            deduplicated_count = _count_items(deduplicated_data)
             
             # Should have fewer or equal items after deduplication
             self.assertLessEqual(deduplicated_count, original_count)
@@ -211,7 +207,7 @@ class TestDedupEndToEnd(unittest.TestCase):
         """Test fuzzy duplicate removal with small threshold for faster testing."""
         try:
             data_dict = convert_df_to_dict(self.df)
-            original_count = count_items(data_dict)
+            original_count = _count_items(data_dict)
             
             # Use small parameters for faster testing
             fuzzy_deduplicated_data = fuzzy_filter(
@@ -222,7 +218,7 @@ class TestDedupEndToEnd(unittest.TestCase):
                 rows_per_band=32  # Fewer rows per band
             )
             
-            fuzzy_count = count_items(fuzzy_deduplicated_data)
+            fuzzy_count = _count_items(fuzzy_deduplicated_data)
             
             # Should have fewer or equal items after fuzzy deduplication
             self.assertLessEqual(fuzzy_count, original_count)
@@ -237,7 +233,7 @@ class TestDedupEndToEnd(unittest.TestCase):
         """Test flattening and reconstruction of data."""
         try:
             data_dict = convert_df_to_dict(self.df)
-            original_count = count_items(data_dict)
+            original_count = _count_items(data_dict)
             
             # Flatten
             flattened_data = flatten_data(data_dict)
@@ -392,11 +388,103 @@ class TestDedupEndToEnd(unittest.TestCase):
         self.assertGreater(similar_code_count, 0, "Should have fuzzy duplicates for testing")
 
 
+class TestIntegrationWithParquetFixtures(unittest.TestCase):
+    """Integration tests using real parquet fixtures."""
+
+    FIXTURES_DIR = os.path.join(os.path.dirname(__file__), 'fixtures')
+
+    @classmethod
+    def setUpClass(cls):
+        """Load parquet fixtures once for all tests."""
+        submissions_path = os.path.join(cls.FIXTURES_DIR, 'submissions_fixture.parquet')
+        if os.path.exists(submissions_path):
+            cls.submissions_df = pd.read_parquet(submissions_path)
+            # Decode bytes to string if needed
+            if cls.submissions_df['code'].dtype == object and len(cls.submissions_df) > 0:
+                if isinstance(cls.submissions_df['code'].iloc[0], bytes):
+                    cls.submissions_df['code'] = cls.submissions_df['code'].apply(
+                        lambda x: x.decode('utf-8') if isinstance(x, bytes) else x
+                    )
+        else:
+            cls.submissions_df = None
+
+    def test_exact_dedup_on_fixture(self):
+        """Test exact deduplication on real fixture data."""
+        if self.submissions_df is None:
+            self.skipTest("Fixture not available")
+
+        data_dict = convert_df_to_dict(self.submissions_df)
+        original_count = _count_items(data_dict)
+
+        deduplicated = remove_duplicates(data_dict)
+        dedup_count = _count_items(deduplicated)
+
+        # Should have same or fewer items
+        self.assertLessEqual(dedup_count, original_count)
+        # Structure should be preserved
+        self.assertEqual(set(data_dict.keys()), set(deduplicated.keys()))
+
+    def test_fuzzy_dedup_on_fixture(self):
+        """Test fuzzy deduplication on real fixture data."""
+        if self.submissions_df is None:
+            self.skipTest("Fixture not available")
+
+        data_dict = convert_df_to_dict(self.submissions_df)
+        original_count = _count_items(data_dict)
+
+        # Use smaller parameters for faster testing
+        fuzzy_deduped = fuzzy_filter(
+            data_dict,
+            threshold=0.5,
+            ngram_size=3,
+            bands=4,
+            rows_per_band=32
+        )
+
+        fuzzy_count = _count_items(fuzzy_deduped)
+
+        # Should have same or fewer items
+        self.assertLessEqual(fuzzy_count, original_count)
+
+    def test_full_pipeline_on_fixture(self):
+        """Test the full dedup pipeline on real fixture data."""
+        if self.submissions_df is None:
+            self.skipTest("Fixture not available")
+
+        data_dict = convert_df_to_dict(self.submissions_df)
+        original_count = _count_items(data_dict)
+
+        # Run exact dedup first
+        exact_deduped = remove_duplicates(data_dict)
+
+        # Then fuzzy dedup with smaller params
+        fuzzy_deduped = fuzzy_filter(
+            exact_deduped,
+            threshold=0.5,
+            ngram_size=3,
+            bands=4,
+            rows_per_band=32
+        )
+
+        # Flatten to DataFrame
+        flattened = flatten_data(fuzzy_deduped)
+        result_df = pd.DataFrame(flattened)
+
+        # Verify output
+        self.assertIsInstance(result_df, pd.DataFrame)
+        self.assertLessEqual(len(result_df), original_count)
+
+        # Should preserve key columns
+        if len(result_df) > 0:
+            self.assertIn('code', result_df.columns)
+            self.assertIn('run_mode', result_df.columns)
+
+
 if __name__ == '__main__':
     # Add some helpful output
     print("Running deduplication pipeline tests...")
     print(f"Python version: {sys.version}")
     print(f"Pandas version: {pd.__version__}")
-    
+
     # Run the tests
     unittest.main(verbosity=2) 
